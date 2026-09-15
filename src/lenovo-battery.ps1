@@ -7,17 +7,28 @@
 #   lenovo-battery.ps1 toggle-rapid
 #   lenovo-battery.ps1 caps            -> cons=<bool> rapid=<bool> raw=0x<hex>
 #
+# Power mode (Fn+Q) via LITSSVC service control codes (OpenLenovoSettings PerformanceModeITS, MIT):
+#   lenovo-battery.ps1 power-get       -> powermode=<Auto|Cool|Performance|Unknown(n)> auto=<n> cur=<n> cap=<n>
+#   lenovo-battery.ps1 power-set -Mode Auto|Cool|Performance
+#   lenovo-battery.ps1 power-step      -> Auto -> Cool -> Performance -> Auto (skips unavailable)
+#   LITSSVC key absent -> prints powermode=absent, exit 0.
+#
 # Exit codes: 0 ok, 2 driver missing (EnergyDrv cannot be opened), 3 firmware ignored the write.
 param(
-    [Parameter(Position = 0)][ValidateSet('get', 'set', 'toggle-conservation', 'toggle-rapid', 'caps')]
+    [Parameter(Position = 0)][ValidateSet('get', 'set', 'toggle-conservation', 'toggle-rapid', 'caps', 'power-get', 'power-set', 'power-step')]
     [string]$Cmd = 'get',
-    [Parameter(Position = 1)][ValidateSet('Normal', 'Conservation', 'RapidCharge')]
+    [Parameter(Position = 1)][ValidateSet('Normal', 'Conservation', 'RapidCharge', 'Auto', 'Cool', 'Performance')]
     [string]$Mode
 )
 
 $IOCTL_CHARGE_MODE = [uint32]'0x831020F8'   # literal 0x831020F8 parses as negative int32
 $RegPath = 'HKCU:\Software\Lenovo\VantageService\AddinData\IdeaNotebookAddin'
 $RegNames = @{ Normal = 'Normal'; RapidCharge = 'Quick'; Conservation = 'Storage' }
+
+# LITSSVC (F3.1/F3.4): registry is read-only for users; writes go through service control codes
+$PowerKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\LITSSVC\LNBITS\IC\MMC'
+$PowerCodes = @{ Auto = 135; Cool = 146; Performance = 148 }
+$PowerOrder = 'Auto', 'Cool', 'Performance'
 
 Add-Type -TypeDefinition @'
 using System; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
@@ -100,8 +111,91 @@ function Set-Mode {
     return $false
 }
 
+# ---- power mode (Fn+Q) ----
+
+# @{auto;cur;cap} or $null when the LITSSVC key is absent (F3.8)
+function Get-PowerModeRaw {
+    $p = Get-ItemProperty -Path $PowerKey -ErrorAction SilentlyContinue
+    if ($null -eq $p -or $null -eq $p.CurrentSetting) { return $null }
+    return @{
+        auto = [int]$p.AutomaticModeSetting
+        cur  = [int]$p.CurrentSetting
+        cap  = [int]$p.Capability
+    }
+}
+
+function ConvertTo-PowerModeName($Raw) {
+    if ($Raw.auto -eq 2) { return 'Auto' }
+    if ($Raw.auto -eq 1 -and $Raw.cur -eq 1) { return 'Cool' }
+    if ($Raw.auto -eq 1 -and $Raw.cur -eq 3) { return 'Performance' }
+    return "Unknown($($Raw.cur))"
+}
+
+function Get-PowerMode {
+    $r = Get-PowerModeRaw
+    if ($null -eq $r) { return $null }
+    return ConvertTo-PowerModeName $r
+}
+
+# capability bitmask (F3.3): bit0 set = Auto NOT available; bit1 = Cool; bit3 = Performance
+function Get-PowerCaps {
+    $r = Get-PowerModeRaw
+    if ($null -eq $r) { return $null }
+    return @{
+        auto        = (($r.cap -band 1) -eq 0)
+        cool        = [bool]($r.cap -band 2)
+        performance = [bool]($r.cap -band 8)
+    }
+}
+
+# $true once the registry reflects the new mode (polled 100 ms up to 2 s), $false otherwise
+function Set-PowerMode {
+    param([Parameter(Mandatory = $true)][ValidateSet('Auto', 'Cool', 'Performance')][string]$Mode)
+    $caps = Get-PowerCaps
+    if ($null -eq $caps) { return $null }
+    if (-not $caps[$Mode.ToLower()]) { Write-Warning "power mode $Mode not available on this model"; return $false }
+    if ((Get-PowerMode) -eq $Mode) { return $true }
+    try {
+        Add-Type -AssemblyName System.ServiceProcess
+        (New-Object System.ServiceProcess.ServiceController 'LITSSVC').ExecuteCommand($PowerCodes[$Mode])
+        for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Milliseconds 100
+            if ((Get-PowerMode) -eq $Mode) { return $true }
+        }
+    } catch {
+        Write-Warning "power-set $Mode failed: $($_.Exception.Message)"
+    }
+    return $false
+}
+
+# cycle Auto -> Cool -> Performance -> Auto over available modes; returns the new mode name
+function Step-PowerMode {
+    $caps = Get-PowerCaps
+    if ($null -eq $caps) { return $null }
+    $avail = @($PowerOrder | Where-Object { $caps[$_.ToLower()] })
+    if ($avail.Count -eq 0) { return $null }
+    $idx = [array]::IndexOf($avail, (Get-PowerMode))   # -1 for Unknown(n) -> first available
+    $next = $avail[($idx + 1) % $avail.Count]
+    if (Set-PowerMode -Mode $next) { return $next }
+    return $null
+}
+
 # dot-sourced (by lenovo-battery-tray.ps1) → expose functions only, no dispatch
 if ($MyInvocation.InvocationName -eq '.') { return }
+
+if ($Cmd -like 'power-*') {
+    if ($null -eq (Get-PowerModeRaw)) { Write-Host 'powermode=absent'; exit 0 }
+    switch ($Cmd) {
+        'power-get'  { $r = Get-PowerModeRaw; 'powermode={0} auto={1} cur={2} cap={3}' -f (ConvertTo-PowerModeName $r), $r.auto, $r.cur, $r.cap }
+        'power-set'  {
+            if ($Mode -notin $PowerOrder) { throw 'power-set needs -Mode Auto|Cool|Performance' }
+            if (-not (Set-PowerMode -Mode $Mode)) { Write-Host "power mode set ignored, state is $(Get-PowerMode)"; exit 3 }
+            $Mode
+        }
+        'power-step' { $n = Step-PowerMode; if ($null -eq $n) { Write-Host "power mode step failed, state is $(Get-PowerMode)"; exit 3 }; $n }
+    }
+    exit 0
+}
 
 $drvErr = [EnergyDrv]::TryOpen()
 if ($drvErr -ne 0) { Write-Host "cannot open \\.\EnergyDrv (Win32 error $drvErr)"; exit 2 }
