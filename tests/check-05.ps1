@@ -31,10 +31,9 @@ Assert ($r1.exit -eq 0) "selftest exit 0 (got $($r1.exit))"
 Assert ($null -ne $r1.line) 'selftest prints "selftest ok" line'
 Assert ((Get-Field $r1.line 'powermode') -eq 'True') 'powermode=True on 82D2'
 Assert ((Get-Field $r1.line 'vantage') -eq 'True') 'vantage=True on 82D2'
-Assert ((Get-Field $r1.line 'hotkeys') -eq '2') 'hotkeys=2 (6/7 wired, 8 power-step skipped until task 06)'
+Assert ((Get-Field $r1.line 'hotkeys') -eq '3') 'hotkeys=3 (6/7/8 wired)'
 Assert ((Get-Field $r1.line 'warnings') -eq '0') 'warnings=0 with default config'
 Assert ([int](Get-Field $r1.line 'items') -ge 10) "items >= 10 (got $(Get-Field $r1.line 'items'))"
-Assert (($r1.out | Where-Object { $_ -match 'power-step' }).Count -ge 1) 'unknown action power-step warned on console'
 
 # 2. malformed config -> exit 0, warnings=1
 $bad = Join-Path $outDir 'bad.json'
@@ -43,7 +42,7 @@ $r2 = Invoke-SelfTest @('-Config', $bad)
 Write-Host "2. bad config: $($r2.line)"
 Assert ($r2.exit -eq 0) "bad config exit 0 (got $($r2.exit))"
 Assert ((Get-Field $r2.line 'warnings') -eq '1') 'bad config warnings=1'
-Assert ((Get-Field $r2.line 'hotkeys') -eq '2') 'bad config still hotkeys=2 (defaults)'
+Assert ((Get-Field $r2.line 'hotkeys') -eq '3') 'bad config still hotkeys=3 (defaults)'
 
 # 3. forced no-power-mode -> powermode=False
 $r3 = Invoke-SelfTest @('-FakeNoPowerMode')
