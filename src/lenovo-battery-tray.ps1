@@ -1,17 +1,18 @@
 # System tray indicator + hotkeys for Lenovo battery charge mode, with Lenovo ITS power mode (Fn+Q).
 #   Conservation = green seedling (taskbar), RapidCharge = yellow bolt (taskbar), Normal = grey heart (overflow).
-#   Power mode  = gauge icon (needle = ITS mode), also in tooltip and menu. Display-only; Fn+Q sets it.
+#   Power mode  = gauge icon (needle = ITS mode), also in tooltip and menu. Menu items set it; hotkey cycles it (F3.9).
 # Left-click: toggle Conservation. Right-click: Win11-styled menu (re-reads state on open). Hover: tooltip w/ keycaps.
 #
-#   lenovo-battery-tray.ps1 [-Config <path>] [-Preview] [-SelfTest] [-FakeNoPowerMode]
+#   lenovo-battery-tray.ps1 [-Config <path>] [-Preview] [-SelfTest [-InvokePowerStep]] [-FakeNoPowerMode]
 #     -Config          config.json path (default %LOCALAPPDATA%\lenovo-battery-tray\config.json, SPEC §8)
 #     -Preview         renders the glyphs to a PNG and opens it.
 #     -SelfTest        build UI + run detection, print one "selftest ok ..." line, exit 0 (no message loop).
+#     -InvokePowerStep with -SelfTest: run one power-step through the tray handler, print "stepped=<from>-><to>".
 #     -FakeNoPowerMode test only: pretend the LITSSVC key is absent (power-mode UI hidden).
 #
 # Push-driven: RegisterHotKey for hotkeys, RegNotifyChangeKeyValue on the ITS registry key for Fn+Q,
 # menu Opening for Vantage-side battery changes. No polling unless pollSeconds > 0.
-param([switch]$Preview, [switch]$MenuShot, [switch]$SelfTest, [switch]$FakeNoPowerMode, [string]$Config)
+param([switch]$Preview, [switch]$MenuShot, [switch]$SelfTest, [switch]$InvokePowerStep, [switch]$FakeNoPowerMode, [string]$Config)
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
 . "$PSScriptRoot\lenovo-battery.ps1"
@@ -34,7 +35,7 @@ $ShowPowerModeIcon = [bool]$Cfg.showPowerModeIcon   # gauge tray icon. Windows g
 $PowerLabels = $Cfg.powerMode.labels   # keyed Auto/Cool/Performance
 $PowerGlyphs = $Cfg.powerMode.glyphs
 $GaugeKinds  = 'GaugeEff', 'GaugeBal', 'GaugePerf'
-$HotkeyActions = 'toggle-conservation', 'toggle-rapid'   # power-step wired in task 06
+$HotkeyActions = 'toggle-conservation', 'toggle-rapid', 'power-step'
 
 $Caps = Get-Caps                                                              # F2.4
 $HasPowerMode = (-not $FakeNoPowerMode) -and ($null -ne (Get-PowerMode))      # F3.8: key absent -> no power UI
@@ -268,6 +269,32 @@ function Invoke-SetMode([string]$Target) {
     Update-Tray
 }
 function Invoke-Toggle([string]$Special) { if ((Get-Mode) -eq $Special) { Invoke-SetMode Normal } else { Invoke-SetMode $Special } }
+# Re-read ITS state and sync every power-mode surface (gauge icon, menu checks, tooltip). Called from the registry
+# watch (external Fn+Q, F3.6) and after our own writes; it never shows a balloon, so an own write that also fires
+# the watch cannot double-balloon.
+function Update-PowerUi {
+    Read-Its
+    if ($ShowPowerModeIcon -and $trayPower.Visible) { $trayPower.Icon = $Icons[$script:Its[1]] }
+    foreach ($v in $miIts.Keys) { $miIts[$v].Checked = ($v -eq $script:PowerName) }
+    if ($tip.Visible) { $tip.Invalidate() }
+}
+# SPEC §10: Set-PowerMode $false -> balloon, UI stays on the real (unchanged) state
+function Invoke-SetPowerMode([string]$Target) {
+    $ok = $false
+    try { $ok = Set-PowerMode -Mode $Target } catch { Write-Warning $_.Exception.Message }
+    if (-not $ok) { Show-Balloon 'Power mode change ignored. Run: lenovo-battery.ps1 diag' }
+    Update-PowerUi
+    return $ok
+}
+# hotkey cycle (F3.9); Fn+Q has no OSD without Vantage, so the balloon is the only feedback. Returns @(from, to).
+function Invoke-PowerStep {
+    $from = $script:PowerName
+    $next = $null
+    try { $next = Step-PowerMode } catch { Write-Warning $_.Exception.Message }
+    Update-PowerUi
+    if ($next) { Show-Balloon "Power mode: $($script:Its[0])" 1500 } else { Show-Balloon 'Power mode change ignored. Run: lenovo-battery.ps1 diag' }
+    return @($from, $script:PowerName)
+}
 
 # ---------------------------------------------------------------- tooltip (custom, keycaps, anchored above icon)
 $tip = New-Object TipForm
@@ -368,13 +395,14 @@ foreach ($m in 'Conservation', 'RapidCharge', 'Normal') {
     $miBattery[$m].Name = $m
 }
 $miIts = @{}
-if ($HasPowerMode) {   # F3.8: whole section absent without LITSSVC; items read-only until task 06
+if ($HasPowerMode) {   # F3.8: whole section absent without LITSSVC
     [void]$menu.Items.Add('-')
     [void](Add-Header 'Power mode')
     $first = $true
     foreach ($v in $PowerOrder) {
         if (-not $PowerCaps[$v.ToLower()]) { continue }   # F3.3
-        $miIts[$v] = Add-Item (Get-PowerDisplay $v)[0] {} $(if ($first) { 'Fn+Q' } else { $null }) 'readonly'
+        $miIts[$v] = Add-Item (Get-PowerDisplay $v)[0] { [void](Invoke-SetPowerMode $this.Name) } $(if ($first) { 'Fn+Q' } else { $null }) $null
+        $miIts[$v].Name = $v
         $first = $false
     }
 }
@@ -385,9 +413,8 @@ if ($VantageAppId) { [void](Add-Item 'Open Lenovo Vantage' { Start-Process explo
 $menu.add_Opening({
     Hide-Tip
     $renderer.Dark = -not (Test-LightApps)
-    Update-Tray; Read-Its                                          # free sync point for Vantage-side changes
+    Update-Tray; Update-PowerUi                                    # free sync point for Vantage-side changes
     foreach ($k in $miBattery.Keys) { $miBattery[$k].Checked = ($k -eq $script:BatMode) }
-    foreach ($v in $miIts.Keys) { $miIts[$v].Checked = ($v -eq $script:PowerName) }
     [TrayNative]::RoundCorners($menu.Handle)
 })
 
@@ -430,11 +457,12 @@ $native.add_HotKey({ param($id)
     switch ($HotkeyAction[$id]) {
         'toggle-conservation' { Invoke-Toggle Conservation }
         'toggle-rapid'        { Invoke-Toggle RapidCharge }
+        'power-step'          { [void](Invoke-PowerStep) }
     }
     if ($tip.Visible) { $tip.Invalidate() }
 })
 if ($HasPowerMode) {
-    $native.add_RegistryChanged({ Read-Its; if ($ShowPowerModeIcon) { $trayPower.Icon = $Icons[$script:Its[1]] }; if ($tip.Visible) { $tip.Invalidate() } })
+    $native.add_RegistryChanged({ Update-PowerUi })   # F3.6: external Fn+Q (and our own writes) land here
     $native.WatchHklm($ItsKey)
 }
 [Microsoft.Win32.SystemEvents]::add_UserPreferenceChanged({ Update-ThemeIcons; Update-Tray })   # light/dark switch
@@ -442,6 +470,12 @@ if ($HasPowerMode) {
 if ($PollSeconds -gt 0) { $poll = New-Object System.Windows.Forms.Timer; $poll.Interval = $PollSeconds * 1000; $poll.add_Tick({ Update-Tray }); $poll.Start() }
 
 if ($SelfTest) {
+    if ($InvokePowerStep) {
+        if (-not $HasPowerMode) { Write-Host 'stepped=absent'; $native.Dispose(); exit 1 }
+        $from, $to = Invoke-PowerStep
+        Write-Host "stepped=$from->$to"
+        if ($from -eq $to) { $native.Dispose(); exit 1 }
+    }
     Write-Host "selftest ok items=$($menu.Items.Count) powermode=$HasPowerMode vantage=$($null -ne $VantageAppId) hotkeys=$HotkeysWired warnings=$($CfgResult.warnings.Count)"
     $native.Dispose(); exit 0
 }
