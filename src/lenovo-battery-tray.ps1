@@ -3,31 +3,47 @@
 #   Power mode  = gauge icon (needle = ITS mode), also in tooltip and menu. Display-only; Fn+Q sets it.
 # Left-click: toggle Conservation. Right-click: Win11-styled menu (re-reads state on open). Hover: tooltip w/ keycaps.
 #
-#   lenovo-battery-tray.ps1 [-Preview]     -Preview renders the glyphs to a PNG and opens it.
+#   lenovo-battery-tray.ps1 [-Config <path>] [-Preview] [-SelfTest] [-FakeNoPowerMode]
+#     -Config          config.json path (default %LOCALAPPDATA%\lenovo-battery-tray\config.json, SPEC §8)
+#     -Preview         renders the glyphs to a PNG and opens it.
+#     -SelfTest        build UI + run detection, print one "selftest ok ..." line, exit 0 (no message loop).
+#     -FakeNoPowerMode test only: pretend the LITSSVC key is absent (power-mode UI hidden).
 #
 # Push-driven: RegisterHotKey for hotkeys, RegNotifyChangeKeyValue on the ITS registry key for Fn+Q,
-# menu Opening for Vantage-side battery changes. No polling unless $PollSeconds > 0.
-param([switch]$Preview, [switch]$MenuShot)
+# menu Opening for Vantage-side battery changes. No polling unless pollSeconds > 0.
+param([switch]$Preview, [switch]$MenuShot, [switch]$SelfTest, [switch]$FakeNoPowerMode, [string]$Config)
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
-# ---------------------------------------------------------------- config
-$Hotkeys = @{
-    'Ctrl+Alt+6' = 'toggle-conservation'
-    'Ctrl+Alt+7' = 'toggle-rapid'
+. "$PSScriptRoot\lenovo-battery.ps1"
+
+# SPEC §10: driver missing -> one message box, exit 1 (error number is informational only, F2.5)
+$drvErr = [EnergyDrv]::TryOpen()
+if ($drvErr -ne 0) {
+    [void][System.Windows.Forms.MessageBox]::Show("Lenovo Energy driver not found (error $drvErr). This tool needs a Lenovo consumer laptop with the ACPI\VPC2004 driver.", 'Lenovo battery tray', 'OK', 'Error')
+    exit 1
 }
-$PollSeconds       = 0        # 0 = off. Safety-net poll for battery changes made inside Vantage.
-$ShowPowerModeIcon = $false   # gauge tray icon for Lenovo power mode. Windows groups tray icons by process,
-                              # so it can't sit in overflow while the battery icon stays in the taskbar - they
-                              # move together. Off by default; power mode still shows in the tooltip and menu.
-$VantageAppId      = 'E046963F.LenovoCompanion_k1h2ywk1493x8!App'
-# Lenovo ITS (Fn+Q) modes: registry value -> label, gauge glyph
-$ItsKey = 'SYSTEM\CurrentControlSet\Services\LITSSVC\LNBITS\IC\MMC'
-$ItsModes = @{
-    0 = @('Intelligent Cooling', 'GaugeBal')
-    1 = @('Battery Saving', 'GaugeEff')
-    2 = @('Quiet', 'GaugeEff')
-    3 = @('Extreme Performance', 'GaugePerf')
-}
+
+# ---------------------------------------------------------------- config (F4.5) + detection
+$CfgResult = if ($Config) { Get-Config -Path $Config } else { Get-Config }
+$Cfg = $CfgResult.config
+$Hotkeys           = $Cfg.hotkeys
+$PollSeconds       = [int]$Cfg.pollSeconds     # 0 = off. Safety-net poll for battery changes made inside Vantage.
+$ShowPowerModeIcon = [bool]$Cfg.showPowerModeIcon   # gauge tray icon. Windows groups tray icons by process, so it
+                              # can't sit in overflow while the battery icon stays in the taskbar - they move
+                              # together. Off by default; power mode still shows in the tooltip and menu.
+$PowerLabels = $Cfg.powerMode.labels   # keyed Auto/Cool/Performance
+$PowerGlyphs = $Cfg.powerMode.glyphs
+$GaugeKinds  = 'GaugeEff', 'GaugeBal', 'GaugePerf'
+$HotkeyActions = 'toggle-conservation', 'toggle-rapid'   # power-step wired in task 06
+
+$Caps = Get-Caps                                                              # F2.4
+$HasPowerMode = (-not $FakeNoPowerMode) -and ($null -ne (Get-PowerMode))      # F3.8: key absent -> no power UI
+$PowerCaps = if ($HasPowerMode) { Get-PowerCaps } else { $null }
+$ItsKey = $PowerKey -replace '^HKLM:\\', ''                                   # F3.1, for RegNotifyChangeKeyValue
+$VantageAppId = $null                                                         # F4.4: resolve at runtime
+$vantagePkg = Get-AppxPackage -Name E046963F.LenovoCompanion -ErrorAction SilentlyContinue
+if ($vantagePkg) { $VantageAppId = $vantagePkg.PackageFamilyName + '!App' }
+
 # Fluent palette
 $Colors = @{
     Conservation = [System.Drawing.Color]::FromArgb(108, 203, 95)
@@ -38,8 +54,6 @@ $Colors = @{
     GaugeLight   = [System.Drawing.Color]::FromArgb(0, 103, 192)
 }
 # ----------------------------------------------------------------
-
-. "$PSScriptRoot\lenovo-battery.ps1"
 
 Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
 using System; using System.Drawing; using System.Runtime.InteropServices; using System.Windows.Forms;
@@ -202,10 +216,22 @@ function Update-ThemeIcons {
 }
 Update-ThemeIcons
 $script:BatMode = $null
-$script:Its = $ItsModes[0]
+$script:PowerName = $null            # Auto | Cool | Performance | Unknown(n) (core name, F3.2)
+$script:Its = @('', 'GaugeBal')      # display: label, gauge glyph
+# label/glyph from config for known names; anything else -> "Mode N" + GaugeBal
+function Get-PowerDisplay([string]$Name) {
+    if ($Name -and $PowerLabels.ContainsKey($Name)) {
+        $glyph = [string]$PowerGlyphs[$Name]
+        if ($glyph -notin $GaugeKinds) { $glyph = 'GaugeBal' }
+        return @([string]$PowerLabels[$Name], $glyph)
+    }
+    $n = if ($Name -match '\((-?\d+)\)') { $Matches[1] } else { '?' }
+    return @("Mode $n", 'GaugeBal')
+}
 function Read-Its {
-    try { $v = [int](Get-ItemProperty "HKLM:\$ItsKey" -ErrorAction Stop).CurrentSetting } catch { $v = -1 }
-    $script:Its = if ($ItsModes.ContainsKey($v)) { $ItsModes[$v] } else { @("Mode $v", 'GaugeBal') }
+    if (-not $HasPowerMode) { return }
+    $script:PowerName = Get-PowerMode
+    $script:Its = Get-PowerDisplay $script:PowerName
 }
 Read-Its
 
@@ -227,8 +253,21 @@ function Update-Tray {
         $trayActive.Icon = $Icons[$m]
         if (-not $trayActive.Visible) { $trayNormal.Visible = $false; $trayActive.Visible = $true }
     }
-    if ($ShowPowerModeIcon) { $trayPower.Icon = $Icons[$script:Its[1]]; $trayPower.Visible = $true }
+    if ($ShowPowerModeIcon -and $HasPowerMode) { $trayPower.Icon = $Icons[$script:Its[1]]; $trayPower.Visible = $true }
 }
+function Show-Balloon([string]$Text, [int]$Ms = 3000) {
+    $ni = if ($trayActive.Visible) { $trayActive } else { $trayNormal }
+    if (-not $ni.Visible) { Write-Warning $Text; return }
+    $ni.BalloonTipTitle = 'Lenovo battery'; $ni.BalloonTipText = $Text; $ni.ShowBalloonTip($Ms)
+}
+# SPEC §10: Set-Mode $false -> balloon, icon stays on the real (unchanged) state, mirror untouched (core)
+function Invoke-SetMode([string]$Target) {
+    $ok = $false
+    try { $ok = Set-Mode -Mode $Target } catch { Write-Warning $_.Exception.Message }
+    if (-not $ok) { Show-Balloon "Firmware ignored $Target. Run: lenovo-battery.ps1 diag" }
+    Update-Tray
+}
+function Invoke-Toggle([string]$Special) { if ((Get-Mode) -eq $Special) { Invoke-SetMode Normal } else { Invoke-SetMode $Special } }
 
 # ---------------------------------------------------------------- tooltip (custom, keycaps, anchored above icon)
 $tip = New-Object TipForm
@@ -242,7 +281,10 @@ function Get-TipTheme {
 function Get-TipLines {
     $bk = switch ($script:BatMode) { 'Conservation' { $HotkeyLabel['toggle-conservation'] } 'RapidCharge' { $HotkeyLabel['toggle-rapid'] } default { $null } }
     $bl = switch ($script:BatMode) { 'RapidCharge' { 'Rapid charge' } default { $script:BatMode } }
-    @(, @("Battery: $bl", $bk)), @(, @("Power: $($script:Its[0])", @('Fn', 'Q')))
+    $lines = New-Object System.Collections.ArrayList   # of @(label, keys); ArrayList so PS doesn't unroll a single line
+    [void]$lines.Add(@("Battery: $bl", $bk))
+    if ($HasPowerMode) { [void]$lines.Add(@("Power: $($script:Its[0])", @('Fn', 'Q'))) }
+    return , $lines
 }
 function Measure-Keycap($g, $k) { [math]::Max($g.MeasureString($k, $tipKeyFont).Width + 4 * $Scale, 16 * $Scale) }
 $tip.add_Paint({
@@ -253,7 +295,7 @@ $tip.add_Paint({
     $kcBottom = New-Object System.Drawing.Pen $th.KcLine, (2 * $Scale); $kcText = New-Object System.Drawing.SolidBrush $th.KcFg
     $g.DrawRectangle((New-Object System.Drawing.Pen $th.Line), 0, 0, $tip.Width - 1, $tip.Height - 1)
     foreach ($ln in (Get-TipLines)) {
-        $label, $keys = $ln[0]
+        $label, $keys = $ln
         $lh = $g.MeasureString($label, $tipFont).Height
         $g.DrawString($label, $tipFont, $text, $pad, $y)
         if ($keys) {
@@ -281,7 +323,7 @@ function Show-Tip($ni) {
     $tip.BackColor = (Get-TipTheme).Bg
     $g = $tip.CreateGraphics(); $pad = 10 * $Scale; $w = 0; $h = $pad
     foreach ($ln in (Get-TipLines)) {
-        $label, $keys = $ln[0]
+        $label, $keys = $ln
         $s = $g.MeasureString($label, $tipFont); $lw = $s.Width
         if ($keys) { $lw += 14 * $Scale; foreach ($k in $keys) { $lw += (Measure-Keycap $g $k) + 3 * $Scale } }
         $w = [math]::Max($w, $lw); $h += $s.Height + 4 * $Scale
@@ -319,30 +361,39 @@ function Add-Item([string]$t, [scriptblock]$on, [string]$shortcut, [string]$tag)
 [void](Add-Header 'Battery charging')
 $miBattery = @{}
 foreach ($m in 'Conservation', 'RapidCharge', 'Normal') {
+    if ($m -eq 'RapidCharge' -and -not $Caps.rapid) { continue }   # SPEC §10 / F2.2: no rapid support -> no item
     $label = if ($m -eq 'RapidCharge') { 'Rapid charge' } else { $m }
     $sc = switch ($m) { 'Conservation' { ($HotkeyLabel['toggle-conservation'] -join '+') } 'RapidCharge' { ($HotkeyLabel['toggle-rapid'] -join '+') } default { $null } }
-    $miBattery[$m] = Add-Item $label { Set-Mode $this.Name; Update-Tray } $sc $null
+    $miBattery[$m] = Add-Item $label { Invoke-SetMode $this.Name } $sc $null
     $miBattery[$m].Name = $m
 }
-[void]$menu.Items.Add('-')
-[void](Add-Header 'Power mode')
 $miIts = @{}
-foreach ($v in ($ItsModes.Keys | Sort-Object)) { $miIts[$v] = Add-Item $ItsModes[$v][0] {} $(if ($v -eq 0) { 'Fn+Q' } else { $null }) 'readonly' }
+if ($HasPowerMode) {   # F3.8: whole section absent without LITSSVC; items read-only until task 06
+    [void]$menu.Items.Add('-')
+    [void](Add-Header 'Power mode')
+    $first = $true
+    foreach ($v in $PowerOrder) {
+        if (-not $PowerCaps[$v.ToLower()]) { continue }   # F3.3
+        $miIts[$v] = Add-Item (Get-PowerDisplay $v)[0] {} $(if ($first) { 'Fn+Q' } else { $null }) 'readonly'
+        $first = $false
+    }
+}
 [void]$menu.Items.Add('-')
-[void](Add-Item 'Open Lenovo Vantage' { Start-Process explorer.exe "shell:AppsFolder\$VantageAppId" } $null $null)
+if ($VantageAppId) { [void](Add-Item 'Open Lenovo Vantage' { Start-Process explorer.exe "shell:AppsFolder\$VantageAppId" } $null $null) }   # F4.4
+[void](Add-Item 'Copy diagnostics' { Set-Clipboard -Value ((Get-DiagLines) -join "`r`n") } $null $null)
 [void](Add-Item 'Exit' { [System.Windows.Forms.Application]::Exit() } $null $null)
 $menu.add_Opening({
     Hide-Tip
     $renderer.Dark = -not (Test-LightApps)
     Update-Tray; Read-Its                                          # free sync point for Vantage-side changes
     foreach ($k in $miBattery.Keys) { $miBattery[$k].Checked = ($k -eq $script:BatMode) }
-    foreach ($v in $miIts.Keys) { $miIts[$v].Checked = ($ItsModes[$v][0] -eq $script:Its[0]) }
+    foreach ($v in $miIts.Keys) { $miIts[$v].Checked = ($v -eq $script:PowerName) }
     [TrayNative]::RoundCorners($menu.Handle)
 })
 
 if ($MenuShot) {   # dev-only: render the menu to PNG for alignment checks
     foreach ($k in $miBattery.Keys) { $miBattery[$k].Checked = ($k -eq 'Conservation') }
-    foreach ($v in $miIts.Keys) { $miIts[$v].Checked = ($v -eq 0) }
+    foreach ($v in $miIts.Keys) { $miIts[$v].Checked = ($v -eq 'Auto') }
     $menu.add_Opened({
         Start-Sleep -Milliseconds 200
         $b = New-Object System.Drawing.Bitmap $menu.Width, $menu.Height
@@ -353,14 +404,17 @@ if ($MenuShot) {   # dev-only: render the menu to PNG for alignment checks
     [System.Windows.Forms.Application]::Run(); return
 }
 
-$onClick = { if ($_.Button -eq 'Left') { Hide-Tip; if ((Get-Mode) -eq 'Conservation') { Set-Mode Normal } else { Set-Mode Conservation }; Update-Tray } }
+$onClick = { if ($_.Button -eq 'Left') { Hide-Tip; Invoke-Toggle Conservation } }
 foreach ($t in $trayActive, $trayNormal, $trayPower) { $t.ContextMenuStrip = $menu; $t.add_MouseClick($onClick); $t.add_MouseMove({ Show-Tip $this }) }
 
 # ---------------------------------------------------------------- native: hotkeys + ITS registry push
 $native = New-Object TrayNative
 $HotkeyAction = @{}
+$HotkeysWired = 0   # combos with a known action (registered or 1409-warned); unknown actions are skipped
 $ModFlags = @{ Ctrl = 0x2; Alt = 0x1; Shift = 0x4; Win = 0x8 }
 foreach ($combo in $Hotkeys.Keys) {
+    if ($Hotkeys[$combo] -notin $HotkeyActions) { Write-Warning "hotkey $combo action '$($Hotkeys[$combo])' unknown, skipped"; continue }
+    $HotkeysWired++
     $mods = 0; $vk = 0
     foreach ($p in $combo.Split('+')) {
         if ($ModFlags.ContainsKey($p)) { $mods = $mods -bor $ModFlags[$p] }
@@ -368,22 +422,31 @@ foreach ($combo in $Hotkeys.Keys) {
         else { $vk = [int][char]::ToUpper([char]$p) }
     }
     $id = $native.Register($mods, $vk)
-    if ($id -lt 0) { Write-Warning "hotkey $combo not registered (win32 error $(-$id)); if 1409, Explorer still owns it - restart explorer or remove the .lnk hotkey" }
+    # F4.3 / SPEC §10: 1409 (already registered) or any other failure -> warn, keep running without that hotkey
+    if ($id -lt 0) { Write-Warning "hotkey $combo not registered (win32 error $(-$id)); if 1409, another process owns it - close the old tray or change the combo in config.json" }
     else { $HotkeyAction[$id] = $Hotkeys[$combo] }
 }
 $native.add_HotKey({ param($id)
     switch ($HotkeyAction[$id]) {
-        'toggle-conservation' { if ((Get-Mode) -eq 'Conservation') { Set-Mode Normal } else { Set-Mode Conservation } }
-        'toggle-rapid'        { if ((Get-Mode) -eq 'RapidCharge')  { Set-Mode Normal } else { Set-Mode RapidCharge } }
+        'toggle-conservation' { Invoke-Toggle Conservation }
+        'toggle-rapid'        { Invoke-Toggle RapidCharge }
     }
-    Update-Tray; if ($tip.Visible) { $tip.Invalidate() }
+    if ($tip.Visible) { $tip.Invalidate() }
 })
-$native.add_RegistryChanged({ Read-Its; if ($ShowPowerModeIcon) { $trayPower.Icon = $Icons[$script:Its[1]] }; if ($tip.Visible) { $tip.Invalidate() } })
-$native.WatchHklm($ItsKey)
+if ($HasPowerMode) {
+    $native.add_RegistryChanged({ Read-Its; if ($ShowPowerModeIcon) { $trayPower.Icon = $Icons[$script:Its[1]] }; if ($tip.Visible) { $tip.Invalidate() } })
+    $native.WatchHklm($ItsKey)
+}
 [Microsoft.Win32.SystemEvents]::add_UserPreferenceChanged({ Update-ThemeIcons; Update-Tray })   # light/dark switch
 
 if ($PollSeconds -gt 0) { $poll = New-Object System.Windows.Forms.Timer; $poll.Interval = $PollSeconds * 1000; $poll.add_Tick({ Update-Tray }); $poll.Start() }
 
+if ($SelfTest) {
+    Write-Host "selftest ok items=$($menu.Items.Count) powermode=$HasPowerMode vantage=$($null -ne $VantageAppId) hotkeys=$HotkeysWired warnings=$($CfgResult.warnings.Count)"
+    $native.Dispose(); exit 0
+}
+
 Update-Tray
+if ($CfgResult.warnings.Count -gt 0) { Show-Balloon ($CfgResult.warnings -join "`n") }   # SPEC §10: malformed config -> warn once
 try { [System.Windows.Forms.Application]::Run() }
 finally { $trayActive.Visible = $false; $trayNormal.Visible = $false; $trayPower.Visible = $false; $native.Dispose() }
