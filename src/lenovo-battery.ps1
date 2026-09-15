@@ -15,7 +15,7 @@
 #
 # Exit codes: 0 ok, 2 driver missing (EnergyDrv cannot be opened), 3 firmware ignored the write.
 param(
-    [Parameter(Position = 0)][ValidateSet('get', 'set', 'toggle-conservation', 'toggle-rapid', 'caps', 'power-get', 'power-set', 'power-step')]
+    [Parameter(Position = 0)][ValidateSet('get', 'set', 'toggle-conservation', 'toggle-rapid', 'caps', 'power-get', 'power-set', 'power-step', 'diag')]
     [string]$Cmd = 'get',
     [Parameter(Position = 1)][ValidateSet('Normal', 'Conservation', 'RapidCharge', 'Auto', 'Cool', 'Performance')]
     [string]$Mode
@@ -244,6 +244,63 @@ function Get-Config {
     return @{ config = $config; warnings = $warnings; path = $Path }
 }
 
+# ---- diag (F4.6, SPEC §9) ----
+
+# Each line independently try/catch'd -> never throws. Order is fixed (task 04).
+function Get-DiagLines {
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    function Add-DiagLine([string]$Key, [scriptblock]$Value) {
+        try {
+            $v = & $Value
+            $lines.Add("$Key=$v")
+        } catch {
+            $lines.Add("$Key=error:$($_.Exception.Message)")
+        }
+    }
+
+    Add-DiagLine 'model' { (Get-CimInstance Win32_ComputerSystemProduct).Version }
+    Add-DiagLine 'mtm' { (Get-CimInstance Win32_ComputerSystem).Model }
+    Add-DiagLine 'bios' { (Get-CimInstance Win32_BIOS).SMBIOSBIOSVersion }
+    Add-DiagLine 'os' {
+        $ver = [Environment]::OSVersion.Version
+        $disp = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).DisplayVersion
+        if (-not $disp) { $disp = 'unknown' }
+        "$ver $disp"
+    }
+    Add-DiagLine 'admin' {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $p = New-Object Security.Principal.WindowsPrincipal($id)
+        $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    Add-DiagLine 'energydrv' {
+        $err = [EnergyDrv]::TryOpen()
+        if ($err -eq 0) { 'ok' } else { "err=$err" }
+    }
+    Add-DiagLine 'raw' { '0x{0:X8}' -f (Get-Raw) }
+    Add-DiagLine 'mode' { Get-Mode }
+    Add-DiagLine 'caps' { $c = Get-Caps; 'cons:{0},rapid:{1}' -f $c.conservation, $c.rapid }
+    Add-DiagLine 'powermode' {
+        $r = Get-PowerModeRaw
+        if ($null -eq $r) { 'absent' } else { ConvertTo-PowerModeName $r }
+    }
+    Add-DiagLine 'powerraw' {
+        $r = Get-PowerModeRaw
+        if ($null -eq $r) { 'absent' } else { 'auto={0} cur={1} cap={2}' -f $r.auto, $r.cur, $r.cap }
+    }
+    Add-DiagLine 'regmirror' {
+        $v = (Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue).BatteryChargeMode
+        if ($null -eq $v) { 'absent' } else { $v }
+    }
+    Add-DiagLine 'services' {
+        $names = 'ImControllerService', 'LenovoFnAndFunctionKeys', 'LenovoVantageService', 'LITSSVC', 'LenovoSmartService', 'LenovoProcessManagement'
+        $running = @(Get-Service -Name $names -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' } | ForEach-Object { $_.Name })
+        $running -join ','
+    }
+
+    return $lines
+}
+
 # dot-sourced (by lenovo-battery-tray.ps1) → expose functions only, no dispatch
 if ($MyInvocation.InvocationName -eq '.') { return }
 
@@ -258,6 +315,11 @@ if ($Cmd -like 'power-*') {
         }
         'power-step' { $n = Step-PowerMode; if ($null -eq $n) { Write-Host "power mode step failed, state is $(Get-PowerMode)"; exit 3 }; $n }
     }
+    exit 0
+}
+
+if ($Cmd -eq 'diag') {
+    Get-DiagLines | ForEach-Object { Write-Host $_ }
     exit 0
 }
 
