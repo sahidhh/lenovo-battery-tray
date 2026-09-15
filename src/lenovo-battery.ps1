@@ -180,6 +180,70 @@ function Step-PowerMode {
     return $null
 }
 
+# ---- config (F4.5) ----
+
+function ConvertTo-ConfigHashtable($Obj) {
+    if ($Obj -is [System.Collections.IDictionary]) { return $Obj }
+    if ($Obj -is [System.Management.Automation.PSCustomObject]) {
+        $h = @{}
+        foreach ($p in $Obj.PSObject.Properties) { $h[$p.Name] = ConvertTo-ConfigHashtable $p.Value }
+        return $h
+    }
+    return $Obj
+}
+
+# deep-merge: only keys already present in $Default are copied from $Override (unknown keys ignored)
+function Merge-Config($Default, $Override) {
+    $result = @{}
+    foreach ($key in $Default.Keys) {
+        $dv = $Default[$key]
+        if ($Override -is [System.Collections.IDictionary] -and $Override.ContainsKey($key)) {
+            $ov = $Override[$key]
+            if ($dv -is [System.Collections.IDictionary] -and $ov -is [System.Collections.IDictionary]) {
+                $result[$key] = Merge-Config $dv $ov
+            } else {
+                $result[$key] = $ov
+            }
+        } else {
+            $result[$key] = $dv
+        }
+    }
+    return $result
+}
+
+function Get-DefaultConfig {
+    return @{
+        hotkeys           = @{ 'Ctrl+Alt+6' = 'toggle-conservation'; 'Ctrl+Alt+7' = 'toggle-rapid'; 'Ctrl+Alt+8' = 'power-step' }
+        pollSeconds       = 0
+        showPowerModeIcon = $false
+        powerMode         = @{
+            labels = @{ Auto = 'Intelligent Cooling'; Cool = 'Battery Saving'; Performance = 'Extreme Performance' }
+            glyphs = @{ Auto = 'GaugeBal'; Cool = 'GaugeEff'; Performance = 'GaugePerf' }
+        }
+    }
+}
+
+# read-only loader; missing file -> defaults, malformed JSON -> one warning + defaults,
+# unknown keys ignored, partial file deep-merged over defaults (SPEC §8)
+function Get-Config {
+    param([string]$Path = "$env:LOCALAPPDATA\lenovo-battery-tray\config.json")
+    $defaults = Get-DefaultConfig
+    $warnings = @()
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @{ config = $defaults; warnings = $warnings; path = $Path }
+    }
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        $json = $raw | ConvertFrom-Json -ErrorAction Stop
+        $override = ConvertTo-ConfigHashtable $json
+        $config = Merge-Config $defaults $override
+    } catch {
+        $warnings += "failed to parse config at $Path : $($_.Exception.Message)"
+        $config = $defaults
+    }
+    return @{ config = $config; warnings = $warnings; path = $Path }
+}
+
 # dot-sourced (by lenovo-battery-tray.ps1) → expose functions only, no dispatch
 if ($MyInvocation.InvocationName -eq '.') { return }
 
