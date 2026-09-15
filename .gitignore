@@ -1,0 +1,4 @@
+*.png
+.claude/settings.local.json
+tests/out/
+dist/
