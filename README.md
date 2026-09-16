@@ -1,6 +1,6 @@
 # lenovo-battery-tray
 
-Tray icon + global hotkeys + CLI for Lenovo consumer laptops: charge mode (Normal / Conservation / Rapid Charge) and Fn+Q power mode. No admin rights. No Lenovo Vantage needed. No install of anything — Windows PowerShell 5.1, in-box. ~110-150 MB RAM (F5.4).
+Tray icon + global hotkeys + CLI for Lenovo consumer laptops: charge mode (Normal / Conservation / Rapid Charge) and Fn+Q power mode. No admin rights. No Lenovo Vantage needed. No install of anything — Windows PowerShell 5.1, in-box. ~110-150 MB RAM.
 
 ## Install
 
@@ -59,7 +59,7 @@ Run `src\lenovo-battery.ps1 diag` and paste its full output into a new issue usi
 
 ## How it works
 
-Charge mode goes through the `\\.\EnergyDrv` device via a documented IOCTL (`0x831020F8`); power mode goes through the `LITSSVC` Windows service's control-code interface. Both work without admin rights on the reference machine. Constants were taken from the MIT-licensed [OpenLenovoSettings](https://github.com/dantmnf/OpenLenovoSettings) project and the Linux kernel's `ideapad-laptop.c` driver. Lenovo Legion Toolkit (GPL-3) was read only as a reference for behavior; no code from it was copied.
+Charge mode goes through the `\\.\EnergyDrv` device via a known IOCTL (`0x831020F8`); power mode goes through the `LITSSVC` Windows service's control-code interface. Both work without admin rights on the reference machine. Constants were taken from the MIT-licensed [OpenLenovoSettings](https://github.com/dantmnf/OpenLenovoSettings) project and the Linux kernel's `ideapad-laptop.c` driver. Lenovo Legion Toolkit (GPL-3) was read only as a reference for behavior; no code from it was copied.
 
 ## Roadmap
 
