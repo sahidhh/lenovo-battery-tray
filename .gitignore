@@ -5,3 +5,4 @@ dist/
 
 # ponytail: docs/ is a nested private repo (sahidhh/lenovo-battery-tray-internal)
 docs/
+.claude/
