@@ -2,6 +2,8 @@
 
 Tray icon + global hotkeys + CLI for Lenovo consumer laptops: charge mode (Normal / Conservation / Rapid Charge) and Fn+Q power mode. No admin rights. No Lenovo Vantage needed. No install of anything — Windows PowerShell 5.1, in-box. ~110-150 MB RAM.
 
+![Tray menu and taskbar icon](assets/hero.png)
+
 ## Install
 
 Download the release zip, extract, run `install.ps1`. It drops a Startup shortcut so the tray starts at login; nothing else on the system is touched.
